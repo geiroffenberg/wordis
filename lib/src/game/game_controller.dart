@@ -229,7 +229,7 @@ class GameController extends ChangeNotifier {
 
   /// Tiles to write into [_board] once the junk drop animation finishes.
   List<({int row, int column, String letter, int points})>
-      _pendingJunkPlacements =
+  _pendingJunkPlacements =
       const <({int row, int column, String letter, int points})>[];
 
   /// Highest level for which junk has already been dropped. Used to
@@ -290,15 +290,16 @@ class GameController extends ChangeNotifier {
       _waitingForJunkDrop = false;
       for (final ({int row, int column, String letter, int points}) p
           in _pendingJunkPlacements) {
-        _board[p.row][p.column] =
-            LetterTile(letter: p.letter, points: p.points);
+        _board[p.row][p.column] = LetterTile(
+          letter: p.letter,
+          points: p.points,
+        );
       }
       _pendingJunkPlacements =
           const <({int row, int column, String letter, int points})>[];
       _spawnNextTile();
       if (!_isGameOver) {
-        _statusMessage =
-            _activeTileHint ?? 'Keep building across and down.';
+        _statusMessage = _activeTileHint ?? 'Keep building across and down.';
       }
       _scheduleTick();
       notifyListeners();
@@ -415,10 +416,7 @@ class GameController extends ChangeNotifier {
 
   void _scheduleTick() {
     _tickTimer?.cancel();
-    if (!_isRunning ||
-        _isGameOver ||
-        _waitingForFlash ||
-        _waitingForJunkDrop) {
+    if (!_isRunning || _isGameOver || _waitingForFlash || _waitingForJunkDrop) {
       return;
     }
 
@@ -461,7 +459,7 @@ class GameController extends ChangeNotifier {
   /// next level. Driven by [_clearedTileCount] (Tetris-style: only
   /// disappearing tiles count toward leveling).
   ({int levelIndex, int tickMs, int tilesIntoLevel, int levelWidth})
-      _resolveLevel() {
+  _resolveLevel() {
     int tilesRemaining = _clearedTileCount;
     for (int i = 0; i < _levelTable.length; i += 1) {
       final ({int width, int tickMs}) entry = _levelTable[i];
@@ -501,7 +499,7 @@ class GameController extends ChangeNotifier {
   /// Cleared tiles still needed to reach the next level.
   int get tilesUntilNextLevel {
     final ({int levelIndex, int tickMs, int tilesIntoLevel, int levelWidth})
-        info = _resolveLevel();
+    info = _resolveLevel();
     return info.levelWidth - info.tilesIntoLevel;
   }
 
@@ -900,8 +898,8 @@ class GameController extends ChangeNotifier {
     available.shuffle(_random);
     final int n = min(count, available.length);
 
-    final List<({int row, int column, String letter, int points})>
-        placements = <({int row, int column, String letter, int points})>[];
+    final List<({int row, int column, String letter, int points})> placements =
+        <({int row, int column, String letter, int points})>[];
     final List<TileDropAnimation> anims = <TileDropAnimation>[];
 
     for (int i = 0; i < n; i += 1) {

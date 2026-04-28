@@ -347,13 +347,12 @@ class _BoardPanelState extends State<_BoardPanel>
     if (pending.isNotEmpty) {
       widget.controller.consumeAnimations();
       widget.sound.playDrop();
-      // Junk drops (fromRow < 0) animate ~3x slower than hard-drops so
-      // the player can see the incoming letters before they land.
-      final bool isJunk = pending.any(
-        (TileDropAnimation d) => d.fromRow < 0,
-      );
+      // Junk drops (fromRow < 0) animate much slower than hard-drops so
+      // the player can see the incoming letters and register the
+      // level-up before play resumes.
+      final bool isJunk = pending.any((TileDropAnimation d) => d.fromRow < 0);
       _animController.duration = isJunk
-          ? const Duration(milliseconds: 360)
+          ? const Duration(milliseconds: 900)
           : const Duration(milliseconds: 120);
       setState(() {
         _activeDrops = pending;
@@ -652,19 +651,19 @@ class _BoardPanelState extends State<_BoardPanel>
                     animation: _levelUpController,
                     builder: (BuildContext context, _) {
                       final double t = _levelUpController.value;
-                      final double rise =
-                          Curves.easeOutCubic.transform(t) * 60;
+                      final double rise = Curves.easeOutCubic.transform(t) * 60;
                       final double opacity = t < 0.15
                           ? t / 0.15
                           : t > 0.78
-                              ? (1.0 - (t - 0.78) / 0.22).clamp(0.0, 1.0)
-                              : 1.0;
-                      final double scale = 0.85 +
-                          0.25 * Curves.easeOutBack.transform(
-                            t.clamp(0.0, 0.45) / 0.45,
-                          );
-                      final double centerY =
-                          (constraints.maxHeight / 2) - rise;
+                          ? (1.0 - (t - 0.78) / 0.22).clamp(0.0, 1.0)
+                          : 1.0;
+                      final double scale =
+                          0.85 +
+                          0.25 *
+                              Curves.easeOutBack.transform(
+                                t.clamp(0.0, 0.45) / 0.45,
+                              );
+                      final double centerY = (constraints.maxHeight / 2) - rise;
                       return IgnorePointer(
                         child: Stack(
                           children: <Widget>[
@@ -690,8 +689,7 @@ class _BoardPanelState extends State<_BoardPanel>
                                             foreground: Paint()
                                               ..style = PaintingStyle.stroke
                                               ..strokeWidth = 4.0
-                                              ..color =
-                                                  const Color(0xCC0E1A16),
+                                              ..color = const Color(0xCC0E1A16),
                                           ),
                                         ),
                                         Text(
@@ -825,11 +823,7 @@ class _BottomControls extends StatelessWidget {
 }
 
 class _BoardSquare extends StatelessWidget {
-  const _BoardSquare({
-    required this.multiplier,
-    this.level = 1,
-    this.child,
-  });
+  const _BoardSquare({required this.multiplier, this.level = 1, this.child});
 
   final int multiplier;
   final int level;
@@ -1348,7 +1342,8 @@ class _LetterValuesGrid extends StatelessWidget {
                     spacing: 4,
                     runSpacing: 4,
                     children: <Widget>[
-                      for (final String letter in group) _LetterChip(letter: letter),
+                      for (final String letter in group)
+                        _LetterChip(letter: letter),
                     ],
                   ),
                 ),
@@ -1392,11 +1387,11 @@ class _LevelSpeedTable extends StatelessWidget {
   const _LevelSpeedTable();
 
   static const List<({String level, String tiles, String tick, String note})>
-      _rows = <({String level, String tiles, String tick, String note})>[
-    (level: '1', tiles: '0',   tick: '1.00 s', note: 'Tutorial pace'),
-    (level: '2', tiles: '20',  tick: '0.80 s', note: ''),
-    (level: '3', tiles: '45',  tick: '0.64 s', note: ''),
-    (level: '4', tiles: '75',  tick: '0.51 s', note: ''),
+  _rows = <({String level, String tiles, String tick, String note})>[
+    (level: '1', tiles: '0', tick: '1.00 s', note: 'Tutorial pace'),
+    (level: '2', tiles: '20', tick: '0.80 s', note: ''),
+    (level: '3', tiles: '45', tick: '0.64 s', note: ''),
+    (level: '4', tiles: '75', tick: '0.51 s', note: ''),
     (level: '5', tiles: '110', tick: '0.41 s', note: ''),
     (level: '6', tiles: '150', tick: '0.33 s', note: ''),
     (level: '7', tiles: '200', tick: '0.27 s', note: ''),
