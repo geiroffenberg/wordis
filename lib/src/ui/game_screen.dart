@@ -107,17 +107,18 @@ class _TopBar extends StatelessWidget {
               color: const Color(0xFFF7EDD8),
             ),
           ),
-          const SizedBox(width: 4),
+          const SizedBox(width: 6),
           SizedBox(
-            width: 28,
-            height: 28,
+            width: 44,
+            height: 44,
             child: IconButton(
               padding: EdgeInsets.zero,
-              iconSize: 18,
+              iconSize: 30,
               icon: const Icon(
                 Icons.info_outline_rounded,
-                color: Color(0x99F0E5D0),
+                color: Color(0xFFF0E5D0),
               ),
+              tooltip: 'How to play',
               onPressed: () => _showInfoDialog(context),
             ),
           ),
@@ -233,9 +234,12 @@ class _BoardPanelState extends State<_BoardPanel>
   late final AnimationController _animController;
   late final AnimationController _flashController;
   late final AnimationController _scoreBurstController;
+  late final AnimationController _levelUpController;
   List<TileDropAnimation> _activeDrops = const <TileDropAnimation>[];
   List<FlashCell> _activeFlashCells = const <FlashCell>[];
   List<ScoreBurstEvent> _activeScoreBursts = const <ScoreBurstEvent>[];
+  int _lastSeenLevel = 1;
+  String? _activeLevelUpText;
 
   /// Keys: "column:toRow" — cells currently being animated into.
   /// We hide the static tile in the grid and show the overlay instead.
@@ -281,6 +285,18 @@ class _BoardPanelState extends State<_BoardPanel>
         });
       }
     });
+    _levelUpController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    );
+    _levelUpController.addStatusListener((AnimationStatus status) {
+      if (status == AnimationStatus.completed) {
+        setState(() {
+          _activeLevelUpText = null;
+        });
+      }
+    });
+    _lastSeenLevel = widget.controller.currentLevel;
     widget.controller.addListener(_onControllerUpdate);
   }
 
@@ -290,10 +306,22 @@ class _BoardPanelState extends State<_BoardPanel>
     _scoreBurstController.dispose();
     _flashController.dispose();
     _animController.dispose();
+    _levelUpController.dispose();
     super.dispose();
   }
 
   void _onControllerUpdate() {
+    final int level = widget.controller.currentLevel;
+    if (level != _lastSeenLevel) {
+      if (level > _lastSeenLevel && widget.controller.isRunning) {
+        setState(() {
+          _activeLevelUpText = 'LEVEL $level';
+        });
+        _levelUpController.forward(from: 0);
+      }
+      _lastSeenLevel = level;
+    }
+
     final List<ScoreBurstEvent> scoreBursts =
         widget.controller.pendingScoreBursts;
     if (scoreBursts.isNotEmpty) {
@@ -319,6 +347,14 @@ class _BoardPanelState extends State<_BoardPanel>
     if (pending.isNotEmpty) {
       widget.controller.consumeAnimations();
       widget.sound.playDrop();
+      // Junk drops (fromRow < 0) animate ~3x slower than hard-drops so
+      // the player can see the incoming letters before they land.
+      final bool isJunk = pending.any(
+        (TileDropAnimation d) => d.fromRow < 0,
+      );
+      _animController.duration = isJunk
+          ? const Duration(milliseconds: 360)
+          : const Duration(milliseconds: 120);
       setState(() {
         _activeDrops = pending;
         _animatingCells.clear();
@@ -334,10 +370,12 @@ class _BoardPanelState extends State<_BoardPanel>
   Widget build(BuildContext context) {
     final GameController controller = widget.controller;
 
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 1200),
+      curve: Curves.easeInOut,
       padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
-        color: const Color(0xFF13342F),
+        color: _boardColorForLevel(controller.currentLevel),
         borderRadius: BorderRadius.circular(14),
       ),
       child: AspectRatio(
@@ -376,6 +414,7 @@ class _BoardPanelState extends State<_BoardPanel>
                       padding: const EdgeInsets.all(2),
                       child: _BoardSquare(
                         multiplier: multiplier,
+                        level: controller.currentLevel,
                         child: (tile != null && !isBeingAnimated)
                             ? _LetterFace(tile: tile)
                             : (isActiveTile && !isBeingAnimated)
@@ -413,6 +452,7 @@ class _BoardPanelState extends State<_BoardPanel>
                                 drop.toRow,
                                 drop.column,
                               ),
+                              level: controller.currentLevel,
                               child: _LetterFace(
                                 tile: LetterTile(
                                   letter: drop.letter,
@@ -605,6 +645,83 @@ class _BoardPanelState extends State<_BoardPanel>
                     },
                   ),
 
+                // Level-up burst (centered, on top of everything except
+                // the modal overlays below).
+                if (_activeLevelUpText != null)
+                  AnimatedBuilder(
+                    animation: _levelUpController,
+                    builder: (BuildContext context, _) {
+                      final double t = _levelUpController.value;
+                      final double rise =
+                          Curves.easeOutCubic.transform(t) * 60;
+                      final double opacity = t < 0.15
+                          ? t / 0.15
+                          : t > 0.78
+                              ? (1.0 - (t - 0.78) / 0.22).clamp(0.0, 1.0)
+                              : 1.0;
+                      final double scale = 0.85 +
+                          0.25 * Curves.easeOutBack.transform(
+                            t.clamp(0.0, 0.45) / 0.45,
+                          );
+                      final double centerY =
+                          (constraints.maxHeight / 2) - rise;
+                      return IgnorePointer(
+                        child: Stack(
+                          children: <Widget>[
+                            Positioned(
+                              left: 0,
+                              right: 0,
+                              top: centerY - 30,
+                              child: Opacity(
+                                opacity: opacity,
+                                child: Transform.scale(
+                                  scale: scale,
+                                  child: Center(
+                                    child: Stack(
+                                      alignment: Alignment.center,
+                                      children: <Widget>[
+                                        Text(
+                                          _activeLevelUpText!,
+                                          textAlign: TextAlign.center,
+                                          style: GoogleFonts.spaceGrotesk(
+                                            fontSize: 44,
+                                            fontWeight: FontWeight.w900,
+                                            letterSpacing: 2.5,
+                                            foreground: Paint()
+                                              ..style = PaintingStyle.stroke
+                                              ..strokeWidth = 4.0
+                                              ..color =
+                                                  const Color(0xCC0E1A16),
+                                          ),
+                                        ),
+                                        Text(
+                                          _activeLevelUpText!,
+                                          textAlign: TextAlign.center,
+                                          style: GoogleFonts.spaceGrotesk(
+                                            fontSize: 44,
+                                            fontWeight: FontWeight.w900,
+                                            letterSpacing: 2.5,
+                                            color: const Color(0xFFFFE6AF),
+                                            shadows: const <Shadow>[
+                                              Shadow(
+                                                color: Color(0xAA000000),
+                                                blurRadius: 12,
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+
                 // Overlays
                 if (!controller.isReady)
                   const _BoardOverlay(message: 'Loading...')
@@ -708,9 +825,14 @@ class _BottomControls extends StatelessWidget {
 }
 
 class _BoardSquare extends StatelessWidget {
-  const _BoardSquare({required this.multiplier, this.child});
+  const _BoardSquare({
+    required this.multiplier,
+    this.level = 1,
+    this.child,
+  });
 
   final int multiplier;
+  final int level;
   final Widget? child;
 
   @override
@@ -720,7 +842,7 @@ class _BoardSquare extends StatelessWidget {
       2 => const Color(0xFF2B6459),
       3 => const Color(0xFF5F5530),
       4 => const Color(0xFF76433C),
-      _ => const Color(0xFF245248),
+      _ => _emptyCellColorForLevel(level),
     };
     final Color borderColor = switch (multiplier) {
       2 => const Color(0x4DB6F1DF),
@@ -729,7 +851,9 @@ class _BoardSquare extends StatelessWidget {
       _ => const Color(0x2C9EE8D4),
     };
 
-    return DecoratedBox(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 1200),
+      curve: Curves.easeInOut,
       decoration: BoxDecoration(
         color: baseColor,
         borderRadius: BorderRadius.circular(8),
@@ -752,6 +876,26 @@ class _BoardSquare extends StatelessWidget {
               : null),
     );
   }
+}
+
+/// Empty-cell colors mirror the level board palette but stay one step
+/// lighter so the cells read as raised against the panel.
+const List<Color> _emptyCellColors = <Color>[
+  Color(0xFF245248), // L1 — teal (original)
+  Color(0xFF1A2A4D), // L2 — midnight (was L10)
+  Color(0xFF3D5A2C), // L3 — dark olive
+  Color(0xFF5D5226), // L4 — warm bronze
+  Color(0xFF6A4126), // L5 — rust
+  Color(0xFF67303C), // L6 — burgundy
+  Color(0xFF592C5C), // L7 — plum
+  Color(0xFF3A2F66), // L8 — violet
+  Color(0xFF233564), // L9 — navy
+  Color(0xFF26614A), // L10+ — emerald (was L2)
+];
+
+Color _emptyCellColorForLevel(int level) {
+  final int idx = (level - 1).clamp(0, _emptyCellColors.length - 1);
+  return _emptyCellColors[idx];
 }
 
 class _ControlButton extends StatelessWidget {
@@ -1044,6 +1188,10 @@ void _showInfoDialog(BuildContext context) {
                 'you earn points based on each letter\'s Scrabble-style value.',
               ),
               const SizedBox(height: 12),
+              _infoHeading('Letter Values'),
+              const SizedBox(height: 6),
+              _LetterValuesGrid(),
+              const SizedBox(height: 12),
               _infoHeading('Multiplier Squares'),
               _infoParagraph(
                 'Two 2x squares are on row 4 and two 3x squares are on row 7 '
@@ -1052,6 +1200,10 @@ void _showInfoDialog(BuildContext context) {
                 'clears. The 4x square is random and relocates after being '
                 'claimed.',
               ),
+              const SizedBox(height: 12),
+              _infoHeading('Scoring Examples'),
+              const SizedBox(height: 6),
+              _ScoringExamplesTable(),
               const SizedBox(height: 12),
               _infoHeading('Matching Letters'),
               _infoParagraph(
@@ -1072,6 +1224,17 @@ void _showInfoDialog(BuildContext context) {
                 'After tiles are cleared, remaining tiles above drop down '
                 'to fill the gaps.',
               ),
+              const SizedBox(height: 12),
+              _infoHeading('Levels & Speed'),
+              _infoParagraph(
+                'Levels advance by tiles cleared, not tiles dropped. '
+                'Stacking random letters never speeds the game up \u2014 '
+                'only words and matching runs do. A 6-letter word counts '
+                'as 6 tiles toward the next level; chain reactions add up '
+                'too. The board hue shifts on every level-up.',
+              ),
+              const SizedBox(height: 8),
+              _LevelSpeedTable(),
               const SizedBox(height: 12),
               _infoHeading('Game Over'),
               _infoParagraph(
@@ -1120,4 +1283,452 @@ Widget _infoParagraph(String text) {
       height: 1.5,
     ),
   );
+}
+
+/// Subtle, equal-luminance palette used to recolor the board background
+/// at each level-up. Each entry is a different hue family but stays in
+/// the same "deep, dim, beautiful" register so the change reads as a
+/// gentle mood shift rather than a UI alert.
+const List<Color> _levelBoardColors = <Color>[
+  Color(0xFF13342F), // L1 — deep teal (original)
+  Color(0xFF0E1A33), // L2 — midnight (was L10)
+  Color(0xFF253E1C), // L3 — dark olive
+  Color(0xFF3D3618), // L4 — warm bronze
+  Color(0xFF452A17), // L5 — rust
+  Color(0xFF421C28), // L6 — burgundy
+  Color(0xFF391A3E), // L7 — plum
+  Color(0xFF231C48), // L8 — violet
+  Color(0xFF142146), // L9 — navy
+  Color(0xFF143E2C), // L10+ — emerald (was L2)
+];
+
+Color _boardColorForLevel(int level) {
+  final int idx = (level - 1).clamp(0, _levelBoardColors.length - 1);
+  return _levelBoardColors[idx];
+}
+
+class _LetterValuesGrid extends StatelessWidget {
+  const _LetterValuesGrid();
+
+  static const List<List<String>> _groups = <List<String>>[
+    <String>['A', 'E', 'I', 'L', 'N', 'O', 'R', 'S', 'T', 'U'],
+    <String>['D', 'G'],
+    <String>['B', 'C', 'M', 'P'],
+    <String>['F', 'H', 'V', 'W', 'Y'],
+    <String>['K'],
+    <String>['J', 'X'],
+    <String>['Q', 'Z'],
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        for (final List<String> group in _groups)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(
+              children: <Widget>[
+                SizedBox(
+                  width: 30,
+                  child: Text(
+                    '${letterPoints[group.first]}',
+                    textAlign: TextAlign.right,
+                    style: GoogleFonts.spaceGrotesk(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      color: const Color(0xFFE9C46A),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Wrap(
+                    spacing: 4,
+                    runSpacing: 4,
+                    children: <Widget>[
+                      for (final String letter in group) _LetterChip(letter: letter),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _LetterChip extends StatelessWidget {
+  const _LetterChip({required this.letter});
+
+  final String letter;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 26,
+      height: 26,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: const Color(0xFF1B3A33),
+        border: Border.all(color: const Color(0x55F0E5D0)),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        letter,
+        style: GoogleFonts.cormorantGaramond(
+          fontSize: 16,
+          fontWeight: FontWeight.w700,
+          color: const Color(0xFFF0E5D0),
+        ),
+      ),
+    );
+  }
+}
+
+class _LevelSpeedTable extends StatelessWidget {
+  const _LevelSpeedTable();
+
+  static const List<({String level, String tiles, String tick, String note})>
+      _rows = <({String level, String tiles, String tick, String note})>[
+    (level: '1', tiles: '0',   tick: '1.00 s', note: 'Tutorial pace'),
+    (level: '2', tiles: '20',  tick: '0.80 s', note: ''),
+    (level: '3', tiles: '45',  tick: '0.64 s', note: ''),
+    (level: '4', tiles: '75',  tick: '0.51 s', note: ''),
+    (level: '5', tiles: '110', tick: '0.41 s', note: ''),
+    (level: '6', tiles: '150', tick: '0.33 s', note: ''),
+    (level: '7', tiles: '200', tick: '0.27 s', note: ''),
+    (level: '8', tiles: '260', tick: '0.23 s', note: ''),
+    (level: '9', tiles: '330', tick: '0.20 s', note: ''),
+    (level: '10+', tiles: '410', tick: '\u2193 5 ms / 100', note: 'Soft floor'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1B3A33),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0x33F0E5D0)),
+      ),
+      child: Column(
+        children: <Widget>[
+          _header(),
+          for (int i = 0; i < _rows.length; i += 1)
+            _row(_rows[i], isEven: i.isEven),
+        ],
+      ),
+    );
+  }
+
+  Widget _header() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: const BoxDecoration(
+        color: Color(0xFF153029),
+        borderRadius: BorderRadius.only(
+          topLeft: Radius.circular(10),
+          topRight: Radius.circular(10),
+        ),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(flex: 2, child: _headerText('Level')),
+          Expanded(flex: 3, child: _headerText('Cleared')),
+          Expanded(flex: 3, child: _headerText('Fall tick')),
+          Expanded(flex: 4, child: _headerText('Note')),
+        ],
+      ),
+    );
+  }
+
+  Widget _headerText(String text) {
+    return Text(
+      text,
+      style: GoogleFonts.spaceGrotesk(
+        fontSize: 11,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 0.6,
+        color: const Color(0xFFE9C46A),
+      ),
+    );
+  }
+
+  Widget _row(
+    ({String level, String tiles, String tick, String note}) row, {
+    required bool isEven,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: isEven ? const Color(0x11000000) : Colors.transparent,
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            flex: 2,
+            child: Text(
+              row.level,
+              style: GoogleFonts.cormorantGaramond(
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+                color: const Color(0xFFE9C46A),
+              ),
+            ),
+          ),
+          Expanded(
+            flex: 3,
+            child: Text(
+              row.tiles,
+              style: GoogleFonts.robotoMono(
+                fontSize: 12,
+                color: const Color(0xDDF7EDD8),
+              ),
+            ),
+          ),
+          Expanded(
+            flex: 3,
+            child: Text(
+              row.tick,
+              style: GoogleFonts.robotoMono(
+                fontSize: 12,
+                color: const Color(0xDDF7EDD8),
+              ),
+            ),
+          ),
+          Expanded(
+            flex: 4,
+            child: Text(
+              row.note,
+              style: GoogleFonts.spaceGrotesk(
+                fontSize: 10,
+                color: const Color(0x99F7EDD8),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ScoringExamplesTable extends StatelessWidget {
+  const _ScoringExamplesTable();
+
+  static int _wordValue(String word) {
+    int total = 0;
+    for (final int code in word.codeUnits) {
+      total += letterPoints[String.fromCharCode(code).toUpperCase()] ?? 0;
+    }
+    return total;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final List<_ScoringRow> rows = <_ScoringRow>[
+      _ScoringRow(
+        example: 'CAT',
+        formula: '3 + 1 + 1',
+        score: _wordValue('CAT'),
+        note: '3-letter word',
+      ),
+      _ScoringRow(
+        example: 'HOUSE',
+        formula: '4 + 1 + 1 + 1 + 1',
+        score: _wordValue('HOUSE'),
+        note: '5-letter word',
+      ),
+      _ScoringRow(
+        example: 'QUARTZ',
+        formula: '10 + 1 + 1 + 1 + 1 + 10',
+        score: _wordValue('QUARTZ'),
+        note: 'High-value letters',
+      ),
+      _ScoringRow(
+        example: 'WORD on 2x',
+        formula: '(4 + 1 + 1 + 2) × 2',
+        score: _wordValue('WORD') * 2,
+        note: 'Any letter on a 2x cell',
+      ),
+      _ScoringRow(
+        example: 'WORD on 3x',
+        formula: '(4 + 1 + 1 + 2) × 3',
+        score: _wordValue('WORD') * 3,
+        note: 'Any letter on a 3x cell',
+      ),
+      _ScoringRow(
+        example: 'WORD on 4x',
+        formula: '(4 + 1 + 1 + 2) × 4',
+        score: _wordValue('WORD') * 4,
+        note: 'Roaming 4x bonus cell',
+      ),
+      _ScoringRow(
+        example: 'Cross words',
+        formula: '(sum of unique letters) × 2',
+        score: 0,
+        showScore: false,
+        note: 'DOUBLE WORD when 2 words form at once',
+      ),
+      _ScoringRow(
+        example: '3 of a kind: SSS',
+        formula: '1 + 1 + 1',
+        score: 3,
+        note: '3 identical letters in a line',
+      ),
+      _ScoringRow(
+        example: '4 of a kind: TTTT',
+        formula: '1 + 1 + 1 + 1',
+        score: 4,
+        note: '4 identical letters in a line',
+      ),
+      _ScoringRow(
+        example: '5× E on 4x',
+        formula: '(1+1+1+1+1) × 4',
+        score: 5 * 4,
+        note: '5 identical letters crossing a 4x',
+      ),
+      _ScoringRow(
+        example: '5× Q on 4x',
+        formula: '(10+10+10+10+10) × 4',
+        score: 50 * 4,
+        note: 'Best run-only combo',
+      ),
+    ];
+
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1B3A33),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0x33F0E5D0)),
+      ),
+      child: Column(
+        children: <Widget>[
+          _scoringHeaderRow(),
+          for (int i = 0; i < rows.length; i += 1)
+            _scoringRowWidget(rows[i], isEven: i.isEven),
+        ],
+      ),
+    );
+  }
+
+  Widget _scoringHeaderRow() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: const BoxDecoration(
+        color: Color(0xFF153029),
+        borderRadius: BorderRadius.only(
+          topLeft: Radius.circular(10),
+          topRight: Radius.circular(10),
+        ),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(flex: 4, child: _scoringHeaderText('Example')),
+          Expanded(flex: 5, child: _scoringHeaderText('Calculation')),
+          SizedBox(
+            width: 48,
+            child: _scoringHeaderText('Pts', align: TextAlign.right),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _scoringHeaderText(String text, {TextAlign align = TextAlign.left}) {
+    return Text(
+      text,
+      textAlign: align,
+      style: GoogleFonts.spaceGrotesk(
+        fontSize: 11,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 0.6,
+        color: const Color(0xFFE9C46A),
+      ),
+    );
+  }
+
+  Widget _scoringRowWidget(_ScoringRow row, {required bool isEven}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: isEven ? const Color(0x11000000) : Colors.transparent,
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Expanded(
+            flex: 4,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  row.example,
+                  style: GoogleFonts.cormorantGaramond(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w700,
+                    color: const Color(0xFFF0E5D0),
+                  ),
+                ),
+                Text(
+                  row.note,
+                  style: GoogleFonts.spaceGrotesk(
+                    fontSize: 10,
+                    color: const Color(0x99F7EDD8),
+                    height: 1.3,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            flex: 5,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                row.formula,
+                style: GoogleFonts.robotoMono(
+                  fontSize: 11,
+                  color: const Color(0xDDF7EDD8),
+                  height: 1.4,
+                ),
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 48,
+            child: Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                row.showScore ? '${row.score}' : '—',
+                textAlign: TextAlign.right,
+                style: GoogleFonts.spaceGrotesk(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  color: const Color(0xFFE9C46A),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ScoringRow {
+  const _ScoringRow({
+    required this.example,
+    required this.formula,
+    required this.score,
+    required this.note,
+    this.showScore = true,
+  });
+
+  final String example;
+  final String formula;
+  final int score;
+  final String note;
+  final bool showScore;
 }

@@ -139,7 +139,7 @@ class GameController extends ChangeNotifier {
   bool _isGameOver = false;
   int _score = 0;
   int _highScore = 0;
-  int _lockedTileCount = 0;
+  int _clearedTileCount = 0;
   int _consecutiveVowelDraws = 0;
   int _consecutiveConsonantDraws = 0;
   String _statusMessage = 'Loading dictionary...';
@@ -151,6 +151,17 @@ class GameController extends ChangeNotifier {
   bool _waitingForFlash = false;
   Set<String> _pendingClearCells = <String>{};
   Map<String, int> _multiplierCells = <String, int>{};
+
+  /// How long a freshly-spawned tile sits at the top before starting
+  /// to fall. Time-based (not tick-based) so it stays meaningful at
+  /// every level: at slow speeds it's invisible, at fast speeds it's
+  /// the only think-time the player gets per tile.
+  static const Duration spawnGraceDuration = Duration(milliseconds: 450);
+
+  /// Wall-clock deadline at which the active tile may begin falling.
+  /// While `DateTime.now()` is before this, ticks skip the fall step
+  /// (the player can still move the tile or hard-drop it).
+  DateTime? _spawnGraceUntil;
 
   bool get isReady => _isReady;
   bool get isRunning => _isRunning;
@@ -212,6 +223,22 @@ class GameController extends ChangeNotifier {
 
   bool _waitingForDropAnimation = false;
 
+  /// True while the 3-letter "junk" drop animation is playing at game
+  /// start or on a level-up. Player ticks are paused during this time.
+  bool _waitingForJunkDrop = false;
+
+  /// Tiles to write into [_board] once the junk drop animation finishes.
+  List<({int row, int column, String letter, int points})>
+      _pendingJunkPlacements =
+      const <({int row, int column, String letter, int points})>[];
+
+  /// Highest level for which junk has already been dropped. Used to
+  /// fire a junk drop exactly once per level boundary crossed.
+  int _levelAtLastJunk = 0;
+
+  /// How many junk letters fall at game start and on every level-up.
+  static const int _junkTilesPerDrop = 3;
+
   /// Called by the UI after it has started playing the animations.
   void consumeAnimations() {
     _pendingAnimations = const <TileDropAnimation>[];
@@ -251,14 +278,32 @@ class GameController extends ChangeNotifier {
     }
 
     _chainStep = 0;
-    _spawnNextTile();
-    _scheduleTick();
+    _spawnAfterTurnOrJunk();
     notifyListeners();
   }
 
-  /// Called by the UI when the hard-drop animation finishes.
-  /// Completes the lock, word check, gravity, and spawns next tile.
+  /// Called by the UI when the hard-drop or junk-drop animation
+  /// finishes. Routes to the right completion path based on which
+  /// drop kind is in flight.
   void completePendingLock() {
+    if (_waitingForJunkDrop) {
+      _waitingForJunkDrop = false;
+      for (final ({int row, int column, String letter, int points}) p
+          in _pendingJunkPlacements) {
+        _board[p.row][p.column] =
+            LetterTile(letter: p.letter, points: p.points);
+      }
+      _pendingJunkPlacements =
+          const <({int row, int column, String letter, int points})>[];
+      _spawnNextTile();
+      if (!_isGameOver) {
+        _statusMessage =
+            _activeTileHint ?? 'Keep building across and down.';
+      }
+      _scheduleTick();
+      notifyListeners();
+      return;
+    }
     if (!_waitingForDropAnimation) {
       return;
     }
@@ -285,7 +330,7 @@ class GameController extends ChangeNotifier {
       row.fillRange(0, row.length, null);
     }
     _score = 0;
-    _lockedTileCount = 0;
+    _clearedTileCount = 0;
     _consecutiveVowelDraws = 0;
     _consecutiveConsonantDraws = 0;
     _activeTileHint = null;
@@ -298,10 +343,14 @@ class GameController extends ChangeNotifier {
     _isGameOver = false;
     _isRunning = true;
     _chainStep = 0;
+    _spawnGraceUntil = null;
+    _waitingForJunkDrop = false;
+    _pendingJunkPlacements =
+        const <({int row, int column, String letter, int points})>[];
+    _levelAtLastJunk = 0;
     _configureMultiplierCells();
     _statusMessage = 'Build the longest word you can.';
-    _spawnNextTile();
-    _scheduleTick();
+    _spawnAfterTurnOrJunk();
     notifyListeners();
   }
 
@@ -333,6 +382,7 @@ class GameController extends ChangeNotifier {
     if (!_isRunning || _activeTile == null) {
       return;
     }
+    _spawnGraceUntil = null;
     final int startRow = _activeTile!.row;
     while (_activeTile != null &&
         _canOccupy(_activeTile!.row + 1, _activeTile!.column)) {
@@ -365,7 +415,10 @@ class GameController extends ChangeNotifier {
 
   void _scheduleTick() {
     _tickTimer?.cancel();
-    if (!_isRunning || _isGameOver || _waitingForFlash) {
+    if (!_isRunning ||
+        _isGameOver ||
+        _waitingForFlash ||
+        _waitingForJunkDrop) {
       return;
     }
 
@@ -375,15 +428,96 @@ class GameController extends ChangeNotifier {
     });
   }
 
-  Duration get _currentTickDuration {
-    final int milliseconds = max(220, 900 - (_lockedTileCount * 12));
-    return Duration(milliseconds: milliseconds);
+  /// Difficulty curve. Each entry is a level: how many *cleared* tiles
+  /// it covers (`width`) and the tick interval used while inside it
+  /// (`tickMs`). Levels advance only when tiles disappear from the
+  /// board, Tetris-style — stacking random letters never speeds the
+  /// game up. Long words and chains advance levels faster because they
+  /// clear more tiles at once.
+  ///
+  /// Beyond the last entry the curve enters a soft-floor mode where
+  /// each additional level subtracts [_softFloorStepMs] from the tick,
+  /// down to [_hardFloorMs]. Each soft-floor level covers
+  /// [_softFloorWidth] cleared tiles.
+  static const List<({int width, int tickMs})> _levelTable =
+      <({int width, int tickMs})>[
+        (width: 20, tickMs: 1000), //  L1: cleared 0-19   (deliberately slow)
+        (width: 25, tickMs: 800), //   L2: 20-44          (-20%)
+        (width: 30, tickMs: 640), //   L3: 45-74          (-20%)
+        (width: 35, tickMs: 510), //   L4: 75-109         (-20%)
+        (width: 40, tickMs: 410), //   L5: 110-149        (-20%)
+        (width: 50, tickMs: 330), //   L6: 150-199        (-20%)
+        (width: 60, tickMs: 270), //   L7: 200-259        (-18%)
+        (width: 70, tickMs: 230), //   L8: 260-329        (-15%)
+        (width: 80, tickMs: 200), //   L9: 330-409        (-13%)
+      ];
+
+  static const int _softFloorWidth = 100;
+  static const int _softFloorStepMs = 5;
+  static const int _hardFloorMs = 150;
+
+  /// Resolves the current level index (0-based), the tick duration in
+  /// ms for that level, and how many cleared tiles remain until the
+  /// next level. Driven by [_clearedTileCount] (Tetris-style: only
+  /// disappearing tiles count toward leveling).
+  ({int levelIndex, int tickMs, int tilesIntoLevel, int levelWidth})
+      _resolveLevel() {
+    int tilesRemaining = _clearedTileCount;
+    for (int i = 0; i < _levelTable.length; i += 1) {
+      final ({int width, int tickMs}) entry = _levelTable[i];
+      if (tilesRemaining < entry.width) {
+        return (
+          levelIndex: i,
+          tickMs: entry.tickMs,
+          tilesIntoLevel: tilesRemaining,
+          levelWidth: entry.width,
+        );
+      }
+      tilesRemaining -= entry.width;
+    }
+    // Soft-floor region: each [_softFloorWidth] cleared tiles past the
+    // table shaves [_softFloorStepMs] off the tick, floored at
+    // [_hardFloorMs].
+    final int extraLevels = tilesRemaining ~/ _softFloorWidth;
+    final int baseTick = _levelTable.last.tickMs;
+    final int tickMs = max(
+      _hardFloorMs,
+      baseTick - (extraLevels + 1) * _softFloorStepMs,
+    );
+    return (
+      levelIndex: _levelTable.length + extraLevels,
+      tickMs: tickMs,
+      tilesIntoLevel: tilesRemaining - extraLevels * _softFloorWidth,
+      levelWidth: _softFloorWidth,
+    );
   }
+
+  /// 1-based difficulty level for UI display.
+  int get currentLevel => _resolveLevel().levelIndex + 1;
+
+  /// Total tiles cleared in this run. Mirrors Tetris's "lines cleared".
+  int get clearedTileCount => _clearedTileCount;
+
+  /// Cleared tiles still needed to reach the next level.
+  int get tilesUntilNextLevel {
+    final ({int levelIndex, int tickMs, int tilesIntoLevel, int levelWidth})
+        info = _resolveLevel();
+    return info.levelWidth - info.tilesIntoLevel;
+  }
+
+  Duration get _currentTickDuration =>
+      Duration(milliseconds: _resolveLevel().tickMs);
 
   void _tick() {
     if (!_isRunning || _activeTile == null) {
       return;
     }
+
+    final DateTime? graceUntil = _spawnGraceUntil;
+    if (graceUntil != null && DateTime.now().isBefore(graceUntil)) {
+      return;
+    }
+    _spawnGraceUntil = null;
 
     final FallingTile currentTile = _activeTile!;
     final int nextRow = currentTile.row + 1;
@@ -468,7 +602,6 @@ class GameController extends ChangeNotifier {
     }
 
     _activeTile = null;
-    _lockedTileCount += 1;
 
     final List<ResolvedWord> resolvedWords = _dictionary.findLongestWords(
       board: _snapshotBoard(),
@@ -501,8 +634,7 @@ class GameController extends ChangeNotifier {
     }
 
     _recentWords = const <ClearedWordSummary>[];
-    _spawnNextTile();
-    _statusMessage = _activeTileHint ?? 'Keep building across and down.';
+    _spawnAfterTurnOrJunk();
     notifyListeners();
   }
 
@@ -621,6 +753,7 @@ class GameController extends ChangeNotifier {
     ];
     _pendingScoreBursts = bursts;
     _pendingClearCells = cellsToClear;
+    _clearedTileCount += cellsToClear.length;
     _waitingForFlash = true;
     notifyListeners();
   }
@@ -684,7 +817,9 @@ class GameController extends ChangeNotifier {
           ];
           final String sig = 'H:$row:$col:${cells.length}';
           if (seenRunSignatures.add(sig)) {
-            entries.add(_ScoredEntry(label: _runSummaryLabel(cells), cells: cells));
+            entries.add(
+              _ScoredEntry(label: _runSummaryLabel(cells), cells: cells),
+            );
           }
         }
         col = end + 1;
@@ -715,7 +850,9 @@ class GameController extends ChangeNotifier {
           ];
           final String sig = 'V:$row:$column:${cells.length}';
           if (seenRunSignatures.add(sig)) {
-            entries.add(_ScoredEntry(label: _runSummaryLabel(cells), cells: cells));
+            entries.add(
+              _ScoredEntry(label: _runSummaryLabel(cells), cells: cells),
+            );
           }
         }
         row = end + 1;
@@ -723,6 +860,122 @@ class GameController extends ChangeNotifier {
     }
 
     return entries;
+  }
+
+  /// Either drops a batch of junk tiles (if a level boundary was just
+  /// crossed) or spawns the next player tile normally. Junk drops fire
+  /// once per level transition and once at game start (level 1 vs the
+  /// initial sentinel of 0).
+  void _spawnAfterTurnOrJunk() {
+    if (_isGameOver) {
+      return;
+    }
+    final int level = currentLevel;
+    if (level > _levelAtLastJunk) {
+      _levelAtLastJunk = level;
+      if (_dropJunkTiles(_junkTilesPerDrop)) {
+        return;
+      }
+    }
+    _spawnNextTile();
+    if (!_isGameOver) {
+      _statusMessage = _activeTileHint ?? 'Keep building across and down.';
+    }
+    _scheduleTick();
+  }
+
+  /// Drops up to [count] random "junk" letters at random columns,
+  /// chosen so they never form a word or matching run on landing.
+  /// Returns true if at least one junk tile was queued for animation.
+  bool _dropJunkTiles(int count) {
+    final List<int> available = <int>[];
+    for (int c = 0; c < boardColumns; c += 1) {
+      if (_board[0][c] == null) {
+        available.add(c);
+      }
+    }
+    if (available.isEmpty) {
+      return false;
+    }
+    available.shuffle(_random);
+    final int n = min(count, available.length);
+
+    final List<({int row, int column, String letter, int points})>
+        placements = <({int row, int column, String letter, int points})>[];
+    final List<TileDropAnimation> anims = <TileDropAnimation>[];
+
+    for (int i = 0; i < n; i += 1) {
+      final int col = available[i];
+      int row = boardRows - 1;
+      while (row >= 0 && _board[row][col] != null) {
+        row -= 1;
+      }
+      if (row < 0) {
+        continue;
+      }
+
+      final String letter = _pickJunkLetter(row, col);
+      final int points = letterPoints[letter] ?? 1;
+
+      // Provisional placement so subsequent picks see this letter
+      // (avoids two junk tiles together accidentally forming a word).
+      _board[row][col] = LetterTile(letter: letter, points: points);
+      placements.add((row: row, column: col, letter: letter, points: points));
+      anims.add(
+        TileDropAnimation(
+          letter: letter,
+          points: points,
+          column: col,
+          fromRow: -1,
+          toRow: row,
+        ),
+      );
+    }
+
+    // Pull the provisional tiles back off — they'll be re-applied when
+    // the animation completes via completePendingLock().
+    for (final ({int row, int column, String letter, int points}) p
+        in placements) {
+      _board[p.row][p.column] = null;
+    }
+
+    if (placements.isEmpty) {
+      return false;
+    }
+
+    _pendingJunkPlacements = placements;
+    _pendingAnimations = anims;
+    _waitingForJunkDrop = true;
+    _tickTimer?.cancel();
+    _statusMessage = 'Incoming junk!';
+    notifyListeners();
+    return true;
+  }
+
+  /// Picks a letter for a junk tile at (row, column) that won't form
+  /// any word or matching run on landing. Falls back to 'Q' if the
+  /// search is exhausted (extremely unlikely on a near-empty board).
+  String _pickJunkLetter(int row, int column) {
+    final List<String> candidates = letterPoints.keys.toList()
+      ..shuffle(_random);
+    for (final String letter in candidates) {
+      _board[row][column] = LetterTile(
+        letter: letter,
+        points: letterPoints[letter] ?? 1,
+      );
+      final List<ResolvedWord> words = _dictionary.findLongestWords(
+        board: _snapshotBoard(),
+        row: row,
+        column: column,
+        minimumLength: minimumWordLength,
+      );
+      final List<List<IndexedCell>> runs = _findMatchingRuns(row, column);
+      _board[row][column] = null;
+      if (words.isEmpty && runs.isEmpty) {
+        return letter;
+      }
+    }
+    return 'Q';
   }
 
   void _spawnNextTile() {
@@ -748,6 +1001,7 @@ class GameController extends ChangeNotifier {
       column: spawnColumn,
       isBlank: tile.isBlank,
     );
+    _spawnGraceUntil = DateTime.now().add(spawnGraceDuration);
   }
 
   int _scoreWordWithMultipliers(ResolvedWord word) {
@@ -816,14 +1070,12 @@ class GameController extends ChangeNotifier {
     final String? runBadge = entry.label.startsWith('TRIPLE ')
         ? 'TRIPLE LETTER'
         : entry.label.startsWith('QUAD ')
-            ? 'QUAD LETTER'
-            : entry.label.startsWith('PENTA ')
-                ? 'PENTA LETTER'
-                : null;
+        ? 'QUAD LETTER'
+        : entry.label.startsWith('PENTA ')
+        ? 'PENTA LETTER'
+        : null;
     if (runBadge != null) {
-      return finalMultiplier > 1
-          ? '$runBadge ${finalMultiplier}x'
-          : runBadge;
+      return finalMultiplier > 1 ? '$runBadge ${finalMultiplier}x' : runBadge;
     }
     if (finalMultiplier > 1) {
       return '${finalMultiplier}x BONUS';
