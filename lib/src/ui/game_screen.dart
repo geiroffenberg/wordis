@@ -470,7 +470,22 @@ class _BoardPanelState extends State<_BoardPanel>
     if (pops.isNotEmpty) {
       widget.controller.consumePopCells();
       setState(() => _popCells = pops);
+      const int cellMs = 350;
+      const int staggerMs = 300;
+      _popController.duration = Duration(
+        milliseconds: cellMs + (pops.length - 1) * staggerMs,
+      );
       _popController.forward(from: 0);
+      // Play the pop sound once per tile, staggered.
+      for (int i = 0; i < pops.length; i++) {
+        if (i == 0) {
+          widget.sound.playPop();
+        } else {
+          Future.delayed(Duration(milliseconds: i * staggerMs), () {
+            if (mounted) widget.sound.playPop();
+          });
+        }
+      }
     }
   }
 
@@ -942,12 +957,22 @@ class _BoardPanelState extends State<_BoardPanel>
                   AnimatedBuilder(
                     animation: _popController,
                     builder: (BuildContext context, _) {
-                      final double t = _popController.value;
-                      final double scale = 1.0 + t * 0.6;
-                      final double opacity = (1.0 - t).clamp(0.0, 1.0);
+                      final double controllerT = _popController.value;
+                      final int n = _popCells.length;
+                      const double cellMs = 350.0;
+                      const double staggerMs = 200.0;
+                      final double totalMs = cellMs + (n - 1) * staggerMs;
                       return IgnorePointer(
                         child: Stack(
-                          children: _popCells.map((FlashCell cell) {
+                          children: List<Widget>.generate(n, (int i) {
+                            final FlashCell cell = _popCells[i];
+                            final double cellStart = (i * staggerMs) / totalMs;
+                            final double cellDuration = cellMs / totalMs;
+                            final double localT = ((controllerT - cellStart) /
+                                    cellDuration)
+                                .clamp(0.0, 1.0);
+                            final double scale = 1.0 + localT * 0.6;
+                            final double opacity = (1.0 - localT).clamp(0.0, 1.0);
                             final double x = cell.column * cellWidth;
                             final double y = cell.row * cellHeight;
                             return Positioned(
@@ -980,7 +1005,7 @@ class _BoardPanelState extends State<_BoardPanel>
                                 ),
                               ),
                             );
-                          }).toList(),
+                          }),
                         ),
                       );
                     },
@@ -1553,9 +1578,9 @@ void _showInfoDialog(BuildContext context) {
               _infoHeading('How to Play'),
               _infoParagraph(
                 'Letters fall one at a time onto a 7\u00d710 board. '
-                'Use the arrow buttons to move left or right. '
-                'Tap the \u21913 button or swipe down anywhere on the board '
-                'to hard-drop the tile instantly.',
+                'Use the arrow buttons \u2014 or swipe left or right on the board \u2014 '
+                'to move the tile. Tap the \u21913 button or swipe down anywhere '
+                'on the board to hard-drop the tile instantly.',
               ),
               const SizedBox(height: 12),
               _infoHeading('Scoring Words'),
@@ -1622,6 +1647,17 @@ void _showInfoDialog(BuildContext context) {
               ),
               const SizedBox(height: 8),
               _LevelSpeedTable(),
+              const SizedBox(height: 12),
+              _infoHeading('Bonus Drops'),
+              _infoParagraph(
+                'Each time you level up, three bonus tiles drop onto the board. '
+                'The game tries to arrange your upcoming tiles to spell a valid '
+                '3-letter word. Watch for the \u2605 BONUS DROP INCOMING \u2605 '
+                'strip pulsing at the board bottom while your current tile lands.\n\n'
+                'If a word can be placed, those tiles land and glow like any '
+                'other marked word \u2014 tap to collect the score. '
+                'If no word fits, the tiles burst off the board instead.',
+              ),
               const SizedBox(height: 12),
               _infoHeading('Strategy Tips'),
               _infoParagraph(
