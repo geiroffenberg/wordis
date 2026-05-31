@@ -112,11 +112,29 @@ class ScoreBurstEvent {
   final String? badgeText;
 }
 
-class _ScoredEntry {
-  const _ScoredEntry({required this.label, required this.cells});
+enum _ScorePhase { formation, clear }
 
-  final String label;
+class MarkedWord {
+  const MarkedWord({
+    required this.signature,
+    required this.axis,
+    required this.word,
+    required this.cells,
+  });
+
+  final String signature;
+  final WordAxis axis;
+  final String word;
   final List<IndexedCell> cells;
+
+  bool containsCell(int row, int column) {
+    for (final IndexedCell cell in cells) {
+      if (cell.row == row && cell.column == column) {
+        return true;
+      }
+    }
+    return false;
+  }
 }
 
 class GameController extends ChangeNotifier {
@@ -133,20 +151,24 @@ class GameController extends ChangeNotifier {
   Timer? _tickTimer;
 
   FallingTile? _activeTile;
-  LetterTile? _nextTile;
+  final List<LetterTile> _upcomingTiles = <LetterTile>[];
   bool _isReady = false;
   bool _isRunning = false;
   bool _isGameOver = false;
   int _score = 0;
   int _highScore = 0;
-  int _clearedTileCount = 0;
+  int _clearedWordCount = 0;
   int _consecutiveVowelDraws = 0;
   int _consecutiveConsonantDraws = 0;
   String _statusMessage = 'Loading dictionary...';
   String? _activeTileHint;
   List<ClearedWordSummary> _recentWords = const <ClearedWordSummary>[];
+  Map<String, MarkedWord> _markedWordsBySignature = <String, MarkedWord>{};
+  Map<String, int> _markedCellCoverage = <String, int>{};
   List<TileDropAnimation> _pendingAnimations = const <TileDropAnimation>[];
   List<FlashCell> _pendingFlashCells = const <FlashCell>[];
+  List<FlashCell> _pendingPopCells = const <FlashCell>[];
+  bool _junkDropCanPop = false;
   List<ScoreBurstEvent> _pendingScoreBursts = const <ScoreBurstEvent>[];
   bool _waitingForFlash = false;
   Set<String> _pendingClearCells = <String>{};
@@ -171,12 +193,36 @@ class GameController extends ChangeNotifier {
   int get tickMilliseconds => _currentTickDuration.inMilliseconds;
   String get statusMessage => _statusMessage;
   FallingTile? get activeTile => _activeTile;
-  LetterTile? get nextTile => _nextTile;
+  LetterTile? get nextTile =>
+      _upcomingTiles.isNotEmpty ? _upcomingTiles.first : null;
+  List<LetterTile> get upcomingTiles =>
+      List<LetterTile>.unmodifiable(_upcomingTiles);
   List<ClearedWordSummary> get recentWords => _recentWords;
+  List<MarkedWord> get markedWords => _markedWordsBySignature.values.toList();
   List<List<LetterTile?>> get board => _board;
   List<TileDropAnimation> get pendingAnimations => _pendingAnimations;
   List<FlashCell> get pendingFlashCells => _pendingFlashCells;
+  List<FlashCell> get pendingPopCells => _pendingPopCells;
   List<ScoreBurstEvent> get pendingScoreBursts => _pendingScoreBursts;
+  int get levelAtLastJunk => _levelAtLastJunk;
+
+  bool isCellMarked(int row, int column) {
+    return (_markedCellCoverage['$row:$column'] ?? 0) > 0;
+  }
+
+  bool isCellMarkedCross(int row, int column) {
+    return (_markedCellCoverage['$row:$column'] ?? 0) >= 2;
+  }
+
+  /// True when every cell in [row] is occupied AND is part of a marked word.
+  /// A tap on any cell in such a row triggers the full line-clear bonus.
+  bool isRowLineClear(int row) {
+    for (int col = 0; col < boardColumns; col += 1) {
+      if (_board[row][col] == null) return false;
+      if (!isCellMarked(row, col)) return false;
+    }
+    return true;
+  }
 
   @visibleForTesting
   void setActiveTileForTesting(FallingTile tile) {
@@ -197,6 +243,8 @@ class GameController extends ChangeNotifier {
   Future<void> initializeForTesting() async {
     _dictionary = await WordDictionary.load();
     _multiplierCells = <String, int>{};
+    _markedWordsBySignature = <String, MarkedWord>{};
+    _markedCellCoverage = <String, int>{};
     _isReady = true;
   }
 
@@ -254,9 +302,14 @@ class GameController extends ChangeNotifier {
     _pendingScoreBursts = const <ScoreBurstEvent>[];
   }
 
+  /// Called by the UI after it has started playing the tile-pop animations.
+  void consumePopCells() {
+    _pendingPopCells = const <FlashCell>[];
+  }
+
   /// Called by the UI when the word-flash animation finishes.
-  /// Clears the word tiles, applies gravity, and either runs another
-  /// chain pass (if more words/runs formed) or spawns the next tile.
+  /// Clears tapped marked words, applies gravity, and then scans for
+  /// newly formed words to mark and score.
   void completeFlashPhase() {
     if (!_waitingForFlash) {
       return;
@@ -269,16 +322,14 @@ class GameController extends ChangeNotifier {
     _pendingClearCells = <String>{};
     _applyGravity();
 
-    // Chain reaction: scan whole board for new words / runs.
-    final List<_ScoredEntry> chainEntries = _scanBoardForEntries();
-    if (chainEntries.isNotEmpty) {
-      _chainStep += 1;
-      _awardEntriesAndStartFlash(chainEntries, isChain: true);
-      return;
+    _refreshMarkedWordsAndAwardFormation();
+    // Only spawn if no tile is currently falling (tap-clear happens during
+    // normal play, so _activeTile is already set; don't overwrite it).
+    if (_activeTile == null) {
+      _spawnAfterTurnOrJunk();
+    } else {
+      _scheduleTick();
     }
-
-    _chainStep = 0;
-    _spawnAfterTurnOrJunk();
     notifyListeners();
   }
 
@@ -288,8 +339,12 @@ class GameController extends ChangeNotifier {
   void completePendingLock() {
     if (_waitingForJunkDrop) {
       _waitingForJunkDrop = false;
+      final List<({int row, int column, String letter, int points})> placed =
+          List<({int row, int column, String letter, int points})>.from(
+        _pendingJunkPlacements,
+      );
       for (final ({int row, int column, String letter, int points}) p
-          in _pendingJunkPlacements) {
+          in placed) {
         _board[p.row][p.column] = LetterTile(
           letter: p.letter,
           points: p.points,
@@ -297,8 +352,26 @@ class GameController extends ChangeNotifier {
       }
       _pendingJunkPlacements =
           const <({int row, int column, String letter, int points})>[];
+      // Detect words formed by the bonus tiles before spawning the next
+      // tile so newly-glowing words are immediately visible to the player.
+      _refreshMarkedWordsAndAwardFormation();
+      // Junk tiles that didn't land in any word pop off the board,
+      // but only for level-2+ drops (the initial seed drop always stays).
+      if (_junkDropCanPop) {
+        final List<FlashCell> pops = <FlashCell>[];
+        for (final ({int row, int column, String letter, int points}) p
+            in placed) {
+          if (!isCellMarked(p.row, p.column)) {
+            _board[p.row][p.column] = null;
+            pops.add(FlashCell(row: p.row, column: p.column));
+          }
+        }
+        if (pops.isNotEmpty) {
+          _pendingPopCells = pops;
+        }
+      }
       _spawnNextTile();
-      if (!_isGameOver) {
+      if (!_isGameOver && _recentWords.isEmpty) {
         _statusMessage = _activeTileHint ?? 'Keep building across and down.';
       }
       _scheduleTick();
@@ -331,25 +404,32 @@ class GameController extends ChangeNotifier {
       row.fillRange(0, row.length, null);
     }
     _score = 0;
-    _clearedTileCount = 0;
+    _clearedWordCount = 0;
     _consecutiveVowelDraws = 0;
     _consecutiveConsonantDraws = 0;
     _activeTileHint = null;
     _recentWords = const <ClearedWordSummary>[];
+    _markedWordsBySignature = <String, MarkedWord>{};
+    _markedCellCoverage = <String, int>{};
+    _upcomingTiles.clear();
     _pendingFlashCells = const <FlashCell>[];
+    _pendingPopCells = const <FlashCell>[];
+    _junkDropCanPop = false;
     _pendingScoreBursts = const <ScoreBurstEvent>[];
     _pendingClearCells = <String>{};
     _waitingForFlash = false;
     _waitingForDropAnimation = false;
     _isGameOver = false;
     _isRunning = true;
-    _chainStep = 0;
     _spawnGraceUntil = null;
     _waitingForJunkDrop = false;
     _pendingJunkPlacements =
         const <({int row, int column, String letter, int points})>[];
     _levelAtLastJunk = 0;
     _configureMultiplierCells();
+    for (int i = 0; i < _upcomingQueueSize; i += 1) {
+      _upcomingTiles.add(_drawLetterTile());
+    }
     _statusMessage = 'Build the longest word you can.';
     _spawnAfterTurnOrJunk();
     notifyListeners();
@@ -439,44 +519,44 @@ class GameController extends ChangeNotifier {
   /// [_softFloorWidth] cleared tiles.
   static const List<({int width, int tickMs})> _levelTable =
       <({int width, int tickMs})>[
-        (width: 20, tickMs: 1000), //  L1: cleared 0-19   (deliberately slow)
-        (width: 25, tickMs: 800), //   L2: 20-44          (-20%)
-        (width: 30, tickMs: 640), //   L3: 45-74          (-20%)
-        (width: 35, tickMs: 510), //   L4: 75-109         (-20%)
-        (width: 40, tickMs: 410), //   L5: 110-149        (-20%)
-        (width: 50, tickMs: 330), //   L6: 150-199        (-20%)
-        (width: 60, tickMs: 270), //   L7: 200-259        (-18%)
-        (width: 70, tickMs: 230), //   L8: 260-329        (-15%)
-        (width: 80, tickMs: 200), //   L9: 330-409        (-13%)
+        (width: 5,  tickMs: 1000), //  L1: words  0-4    (slow intro)
+        (width: 7,  tickMs: 800),  //  L2: 5-11          (-20%)
+        (width: 9,  tickMs: 640),  //  L3: 12-20         (-20%)
+        (width: 12, tickMs: 510),  //  L4: 21-32         (-20%)
+        (width: 15, tickMs: 410),  //  L5: 33-47         (-20%)
+        (width: 18, tickMs: 330),  //  L6: 48-65         (-20%)
+        (width: 22, tickMs: 270),  //  L7: 66-87         (-18%)
+        (width: 26, tickMs: 230),  //  L8: 88-113        (-15%)
+        (width: 30, tickMs: 200),  //  L9: 114-143       (-13%)
       ];
 
-  static const int _softFloorWidth = 100;
+  static const int _softFloorWidth = 35;
   static const int _softFloorStepMs = 5;
-  static const int _hardFloorMs = 150;
+  static const int _hardFloorMs = 200;
 
   /// Resolves the current level index (0-based), the tick duration in
   /// ms for that level, and how many cleared tiles remain until the
-  /// next level. Driven by [_clearedTileCount] (Tetris-style: only
-  /// disappearing tiles count toward leveling).
-  ({int levelIndex, int tickMs, int tilesIntoLevel, int levelWidth})
+  /// next level. Driven by [_clearedWordCount] (Tetris-style: only
+  /// cleared words count toward leveling — placing tiles does not).
+  ({int levelIndex, int tickMs, int wordsIntoLevel, int levelWidth})
   _resolveLevel() {
-    int tilesRemaining = _clearedTileCount;
+    int wordsRemaining = _clearedWordCount;
     for (int i = 0; i < _levelTable.length; i += 1) {
       final ({int width, int tickMs}) entry = _levelTable[i];
-      if (tilesRemaining < entry.width) {
+      if (wordsRemaining < entry.width) {
         return (
           levelIndex: i,
           tickMs: entry.tickMs,
-          tilesIntoLevel: tilesRemaining,
+          wordsIntoLevel: wordsRemaining,
           levelWidth: entry.width,
         );
       }
-      tilesRemaining -= entry.width;
+      wordsRemaining -= entry.width;
     }
-    // Soft-floor region: each [_softFloorWidth] cleared tiles past the
+    // Soft-floor region: each [_softFloorWidth] cleared words past the
     // table shaves [_softFloorStepMs] off the tick, floored at
     // [_hardFloorMs].
-    final int extraLevels = tilesRemaining ~/ _softFloorWidth;
+    final int extraLevels = wordsRemaining ~/ _softFloorWidth;
     final int baseTick = _levelTable.last.tickMs;
     final int tickMs = max(
       _hardFloorMs,
@@ -485,7 +565,7 @@ class GameController extends ChangeNotifier {
     return (
       levelIndex: _levelTable.length + extraLevels,
       tickMs: tickMs,
-      tilesIntoLevel: tilesRemaining - extraLevels * _softFloorWidth,
+      wordsIntoLevel: wordsRemaining - extraLevels * _softFloorWidth,
       levelWidth: _softFloorWidth,
     );
   }
@@ -494,13 +574,14 @@ class GameController extends ChangeNotifier {
   int get currentLevel => _resolveLevel().levelIndex + 1;
 
   /// Total tiles cleared in this run. Mirrors Tetris's "lines cleared".
-  int get clearedTileCount => _clearedTileCount;
+  /// Total words cleared in this run (each tapped word = 1).
+  int get clearedWordCount => _clearedWordCount;
 
-  /// Cleared tiles still needed to reach the next level.
-  int get tilesUntilNextLevel {
-    final ({int levelIndex, int tickMs, int tilesIntoLevel, int levelWidth})
+  /// Words still needed to reach the next level.
+  int get wordsUntilNextLevel {
+    final ({int levelIndex, int tickMs, int wordsIntoLevel, int levelWidth})
     info = _resolveLevel();
-    return info.levelWidth - info.tilesIntoLevel;
+    return info.levelWidth - info.wordsIntoLevel;
   }
 
   Duration get _currentTickDuration =>
@@ -601,147 +682,65 @@ class GameController extends ChangeNotifier {
 
     _activeTile = null;
 
-    final List<ResolvedWord> resolvedWords = _dictionary.findLongestWords(
-      board: _snapshotBoard(),
-      row: lockedTile.row,
-      column: lockedTile.column,
-      minimumLength: minimumWordLength,
-    );
-
-    final List<List<IndexedCell>> matchingRuns = _findMatchingRuns(
-      lockedTile.row,
-      lockedTile.column,
-    );
-
-    final bool hasWords = resolvedWords.isNotEmpty;
-    final bool hasMatches = matchingRuns.isNotEmpty;
-
-    if (hasWords || hasMatches) {
-      final List<_ScoredEntry> entries = <_ScoredEntry>[];
-      for (final ResolvedWord word in resolvedWords) {
-        entries.add(
-          _ScoredEntry(label: word.word.toUpperCase(), cells: word.cells),
-        );
-      }
-      for (final List<IndexedCell> run in matchingRuns) {
-        entries.add(_ScoredEntry(label: _runSummaryLabel(run), cells: run));
-      }
-
-      _awardEntriesAndStartFlash(entries, isChain: false);
-      return;
-    }
-
-    _recentWords = const <ClearedWordSummary>[];
+    _refreshMarkedWordsAndAwardFormation();
     _spawnAfterTurnOrJunk();
     notifyListeners();
   }
 
-  int _chainStep = 0;
+  static const List<double> _clearLengthFactors = <double>[
+    1.00, // 3
+    1.35, // 4
+    1.80, // 5
+    2.40, // 6
+    3.10, // 7
+  ];
 
-  /// Score the given list of word/run entries and start the flash/clear
-  /// animation for them. [isChain] is true when invoked by gravity-driven
-  /// chain reactions (post first scoring pass).
-  void _awardEntriesAndStartFlash(
-    List<_ScoredEntry> entries, {
-    required bool isChain,
-  }) {
-    final Set<String> cellsToClear = <String>{};
-    final Map<String, IndexedCell> uniqueCellsByKey = <String, IndexedCell>{};
-    for (final _ScoredEntry entry in entries) {
-      for (final IndexedCell cell in entry.cells) {
-        final String key = '${cell.row}:${cell.column}';
-        cellsToClear.add(key);
-        uniqueCellsByKey[key] = cell;
+  void _refreshMarkedWordsAndAwardFormation() {
+    final List<MarkedWord> detectedWords = _scanBoardForMarkedWords();
+    final Map<String, MarkedWord> detectedBySignature = <String, MarkedWord>{
+      for (final MarkedWord word in detectedWords) word.signature: word,
+    };
+
+    final List<MarkedWord> newlyFormedWords = <MarkedWord>[];
+    for (final MarkedWord detected in detectedWords) {
+      if (!_markedWordsBySignature.containsKey(detected.signature)) {
+        newlyFormedWords.add(detected);
       }
     }
-    final List<IndexedCell> uniqueCells = uniqueCellsByKey.values.toList();
 
-    final int baseSum = uniqueCells.fold<int>(
-      0,
-      (int total, IndexedCell cell) => total + cell.points,
-    );
-    final int cellMultiplier = _maxMultiplierForCells(uniqueCells);
-    final bool isDoubleWord = entries.length >= 2;
-    final int finalMultiplier = isDoubleWord
-        ? max(2, cellMultiplier)
-        : cellMultiplier;
-    final int earnedScore = baseSum * finalMultiplier;
+    _markedWordsBySignature = detectedBySignature;
+    _rebuildMarkedCellCoverage();
 
-    final List<ClearedWordSummary> summaries = <ClearedWordSummary>[];
-    for (final _ScoredEntry entry in entries) {
-      final int entryBase = entry.cells.fold<int>(
-        0,
-        (int total, IndexedCell cell) => total + cell.points,
-      );
-      summaries.add(ClearedWordSummary(word: entry.label, score: entryBase));
+    if (newlyFormedWords.isEmpty) {
+      _recentWords = const <ClearedWordSummary>[];
+      return;
     }
 
-    final List<ScoreBurstEvent> bursts = <ScoreBurstEvent>[];
-    final String? chainPrefix = isChain && _chainStep >= 1
-        ? 'CHAIN x${_chainStep + 1}'
-        : null;
-    if (!isDoubleWord) {
-      final _ScoredEntry only = entries.single;
-      String? badge = _badgeForEntry(only, finalMultiplier);
-      if (chainPrefix != null) {
-        badge = badge == null ? chainPrefix : '$chainPrefix • $badge';
-      }
-      bursts.add(
-        _buildScoreBurst(
-          cells: only.cells,
-          score: earnedScore,
-          maxMultiplier: finalMultiplier,
-          badgeText: badge,
-        ),
-      );
-    } else {
-      String badge = finalMultiplier > 2
-          ? 'DOUBLE WORD ${finalMultiplier}x'
-          : 'DOUBLE WORD';
-      if (chainPrefix != null) {
-        badge = '$chainPrefix • $badge';
-      }
-      bursts.add(
-        _buildScoreBurst(
-          cells: uniqueCells,
-          score: earnedScore,
-          maxMultiplier: finalMultiplier,
-          badgeText: badge,
-        ),
-      );
-    }
+    _awardWords(newlyFormedWords, phase: _ScorePhase.formation);
+  }
 
-    _relocateFourXIfClaimed(cellsToClear);
-
-    _recentWords = summaries;
-    _score += earnedScore;
-
-    final List<String> statusParts = summaries
-        .map((ClearedWordSummary w) => w.word)
+  void _clearMarkedWordsAt({required int row, required int column}) {
+    final List<MarkedWord> touchedWords = _markedWordsBySignature.values
+        .where((MarkedWord word) => word.containsCell(row, column))
         .toList();
-    String statusMessage;
-    if (isDoubleWord) {
-      final String bonusLabel = finalMultiplier > 2
-          ? 'DOUBLE WORD ${finalMultiplier}x'
-          : 'DOUBLE WORD';
-      statusMessage =
-          '${statusParts.join(' + ')}  •  $bonusLabel +$earnedScore';
-    } else if (finalMultiplier > 1) {
-      statusMessage =
-          '${statusParts.first}  •  ${finalMultiplier}x BONUS +$earnedScore';
-    } else {
-      statusMessage = '${statusParts.first} +$earnedScore';
-    }
-    if (chainPrefix != null) {
-      statusMessage = '$chainPrefix • $statusMessage';
-    }
-    _statusMessage = statusMessage;
-
-    if (_score > _highScore) {
-      _highScore = _score;
-      unawaited(_preferences?.setInt(highScoreKey, _highScore));
+    if (touchedWords.isEmpty) {
+      return;
     }
 
+    final Set<String> cellsToClear = <String>{};
+    for (final MarkedWord word in touchedWords) {
+      for (final IndexedCell cell in word.cells) {
+        cellsToClear.add('${cell.row}:${cell.column}');
+      }
+    }
+
+    _awardWords(
+      touchedWords,
+      phase: _ScorePhase.clear,
+      clearedCellCount: cellsToClear.length,
+    );
+    _relocateFourXIfClaimed(cellsToClear);
+    _pendingClearCells = cellsToClear;
     _pendingFlashCells = <FlashCell>[
       for (final String cell in cellsToClear)
         FlashCell(
@@ -749,22 +748,195 @@ class GameController extends ChangeNotifier {
           column: int.parse(cell.split(':')[1]),
         ),
     ];
-    _pendingScoreBursts = bursts;
-    _pendingClearCells = cellsToClear;
-    _clearedTileCount += cellsToClear.length;
+    _clearedWordCount += touchedWords.length;
+
+    for (final MarkedWord word in touchedWords) {
+      _markedWordsBySignature.remove(word.signature);
+    }
+    _rebuildMarkedCellCoverage();
+
     _waitingForFlash = true;
     notifyListeners();
   }
 
-  /// Scans the entire board for words (any length >= [minimumWordLength])
-  /// and runs of 3+ identical letters. Returns deduplicated entries.
-  List<_ScoredEntry> _scanBoardForEntries() {
-    final BoardSnapshot snapshot = _snapshotBoard();
-    final List<_ScoredEntry> entries = <_ScoredEntry>[];
+  /// Clears an entire row that is fully covered by marked words.
+  /// Awards all words touching the row with a 2× LINE CLEAR bonus on top of
+  /// the normal clear-length multiplier, then sets up the flash phase.
+  void _clearLineAt(int row) {
+    // Collect every marked word that has at least one cell in this row.
+    final List<MarkedWord> rowWords = _markedWordsBySignature.values
+        .where(
+          (MarkedWord w) => w.cells.any((IndexedCell c) => c.row == row),
+        )
+        .toList();
 
-    // Word scan: longest match per (axis, start cell, length) — dedup by
-    // a signature of the spanning cells.
-    final Set<String> seenWordSignatures = <String>{};
+    // Cells to clear: all cells of touching words, plus every board cell in
+    // the row (handles the unlikely case of an unmarked tile in the row).
+    final Set<String> cellsToClear = <String>{};
+    for (int col = 0; col < boardColumns; col += 1) {
+      cellsToClear.add('$row:$col');
+    }
+    for (final MarkedWord word in rowWords) {
+      for (final IndexedCell cell in word.cells) {
+        cellsToClear.add('${cell.row}:${cell.column}');
+      }
+    }
+
+    _awardWords(
+      rowWords,
+      phase: _ScorePhase.clear,
+      clearedCellCount: cellsToClear.length,
+      lineBonus: true,
+    );
+    _relocateFourXIfClaimed(cellsToClear);
+    _pendingClearCells = cellsToClear;
+    _pendingFlashCells = <FlashCell>[
+      for (final String cell in cellsToClear)
+        FlashCell(
+          row: int.parse(cell.split(':')[0]),
+          column: int.parse(cell.split(':')[1]),
+        ),
+    ];
+    _clearedWordCount += rowWords.length;
+
+    for (final MarkedWord word in rowWords) {
+      _markedWordsBySignature.remove(word.signature);
+    }
+    _rebuildMarkedCellCoverage();
+
+    _waitingForFlash = true;
+    notifyListeners();
+  }
+
+  void _awardWords(
+    List<MarkedWord> words, {
+    required _ScorePhase phase,
+    int? clearedCellCount,
+    bool lineBonus = false,
+  }) {
+    final Set<String> cellsToScore = <String>{};
+    final Map<String, IndexedCell> uniqueCellsByKey = <String, IndexedCell>{};
+    for (final MarkedWord word in words) {
+      for (final IndexedCell cell in word.cells) {
+        final String key = '${cell.row}:${cell.column}';
+        cellsToScore.add(key);
+        uniqueCellsByKey[key] = cell;
+      }
+    }
+    final List<IndexedCell> uniqueCells = uniqueCellsByKey.values.toList();
+    final int baseSum = uniqueCells.fold<int>(
+      0,
+      (int total, IndexedCell cell) => total + cell.points,
+    );
+
+    final int cellMultiplier = _maxMultiplierForCells(uniqueCells);
+    final bool crossWordBonus = _hasCrossWordBonus(words);
+    final int finalMultiplier = crossWordBonus
+        ? max(2, cellMultiplier)
+        : cellMultiplier;
+
+    int earnedScore = baseSum * finalMultiplier;
+    if (phase == _ScorePhase.clear) {
+      final int letterCount = clearedCellCount ?? uniqueCells.length;
+      final double lengthFactor = _clearLengthFactor(letterCount);
+      final double levelFactor = 1.0 + ((currentLevel - 1) * 0.12);
+      earnedScore = (earnedScore * lengthFactor * levelFactor).round();
+    }
+    if (lineBonus) {
+      earnedScore *= 2;
+    }
+
+    final List<ClearedWordSummary> summaries = <ClearedWordSummary>[
+      for (final MarkedWord word in words)
+        ClearedWordSummary(word: word.word.toUpperCase(), score: _wordBase(word)),
+    ];
+
+    String? badge;
+    if (lineBonus) {
+      badge = 'LINE CLEAR! \u00d72';
+    } else if (crossWordBonus) {
+      badge = finalMultiplier > 2
+          ? 'DOUBLE WORD ${finalMultiplier}x'
+          : 'DOUBLE WORD';
+    } else if (finalMultiplier > 1) {
+      badge = '${finalMultiplier}x BONUS';
+    }
+    if (phase == _ScorePhase.clear) {
+      final int letterCount = clearedCellCount ?? uniqueCells.length;
+      final String levelStr = currentLevel > 1 ? '  Lv$currentLevel' : '';
+      final String clearBadge = 'CLEAR ${letterCount}L$levelStr';
+      badge = badge == null ? clearBadge : '$badge  $clearBadge';
+    }
+
+    final ScoreBurstEvent burst = _buildScoreBurst(
+      cells: uniqueCells,
+      score: earnedScore,
+      maxMultiplier: finalMultiplier,
+      badgeText: badge,
+    );
+
+    _recentWords = summaries;
+    _score += earnedScore;
+    _pendingScoreBursts = <ScoreBurstEvent>[burst];
+
+    final String joinedWords = summaries
+        .map((ClearedWordSummary summary) => summary.word)
+        .join(' + ');
+    final String scoreVerb =
+        phase == _ScorePhase.clear ? 'cleared' : 'formed';
+    _statusMessage = lineBonus
+        ? 'LINE CLEAR! $joinedWords +$earnedScore'
+        : '$joinedWords $scoreVerb +$earnedScore';
+
+    if (_score > _highScore) {
+      _highScore = _score;
+      unawaited(_preferences?.setInt(highScoreKey, _highScore));
+    }
+  }
+
+  int _wordBase(MarkedWord word) {
+    return word.cells.fold<int>(
+      0,
+      (int total, IndexedCell cell) => total + cell.points,
+    );
+  }
+
+  bool _hasCrossWordBonus(List<MarkedWord> words) {
+    if (words.length < 2) {
+      return false;
+    }
+    for (int i = 0; i < words.length; i += 1) {
+      for (int j = i + 1; j < words.length; j += 1) {
+        final MarkedWord a = words[i];
+        final MarkedWord b = words[j];
+        if (a.axis == b.axis) {
+          continue;
+        }
+        for (final IndexedCell cell in a.cells) {
+          if (b.containsCell(cell.row, cell.column)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  double _clearLengthFactor(int lettersCleared) {
+    if (lettersCleared <= 3) {
+      return _clearLengthFactors[0];
+    }
+    final int index = lettersCleared - 3;
+    if (index < _clearLengthFactors.length) {
+      return _clearLengthFactors[index];
+    }
+    return _clearLengthFactors.last + ((lettersCleared - 7) * 0.8);
+  }
+
+  List<MarkedWord> _scanBoardForMarkedWords() {
+    final BoardSnapshot snapshot = _snapshotBoard();
+    final Map<String, MarkedWord> bySignature = <String, MarkedWord>{};
+
     for (int row = 0; row < boardRows; row += 1) {
       for (int column = 0; column < boardColumns; column += 1) {
         if (_board[row][column] == null) {
@@ -777,87 +949,34 @@ class GameController extends ChangeNotifier {
           minimumLength: minimumWordLength,
         );
         for (final ResolvedWord word in words) {
-          final String sig =
-              '${word.axis}:${word.cells.first.row}:${word.cells.first.column}:${word.cells.length}';
-          if (seenWordSignatures.add(sig)) {
-            entries.add(
-              _ScoredEntry(label: word.word.toUpperCase(), cells: word.cells),
-            );
-          }
+          final String signature = _wordSignature(word);
+          bySignature[signature] = MarkedWord(
+            signature: signature,
+            axis: word.axis,
+            word: word.word,
+            cells: word.cells,
+          );
         }
       }
     }
 
-    // Run scan: 3+ identical letters horizontally and vertically.
-    final Set<String> seenRunSignatures = <String>{};
-    for (int row = 0; row < boardRows; row += 1) {
-      int col = 0;
-      while (col < boardColumns) {
-        final LetterTile? tile = _board[row][col];
-        if (tile == null) {
-          col += 1;
-          continue;
-        }
-        int end = col;
-        while (end + 1 < boardColumns &&
-            _board[row][end + 1]?.letter == tile.letter) {
-          end += 1;
-        }
-        if (end - col + 1 >= 3) {
-          final List<IndexedCell> cells = <IndexedCell>[
-            for (int c = col; c <= end; c += 1)
-              IndexedCell(
-                row: row,
-                column: c,
-                letter: _board[row][c]!.letter,
-                points: _board[row][c]!.effectivePoints,
-              ),
-          ];
-          final String sig = 'H:$row:$col:${cells.length}';
-          if (seenRunSignatures.add(sig)) {
-            entries.add(
-              _ScoredEntry(label: _runSummaryLabel(cells), cells: cells),
-            );
-          }
-        }
-        col = end + 1;
-      }
-    }
-    for (int column = 0; column < boardColumns; column += 1) {
-      int row = 0;
-      while (row < boardRows) {
-        final LetterTile? tile = _board[row][column];
-        if (tile == null) {
-          row += 1;
-          continue;
-        }
-        int end = row;
-        while (end + 1 < boardRows &&
-            _board[end + 1][column]?.letter == tile.letter) {
-          end += 1;
-        }
-        if (end - row + 1 >= 3) {
-          final List<IndexedCell> cells = <IndexedCell>[
-            for (int r = row; r <= end; r += 1)
-              IndexedCell(
-                row: r,
-                column: column,
-                letter: _board[r][column]!.letter,
-                points: _board[r][column]!.effectivePoints,
-              ),
-          ];
-          final String sig = 'V:$row:$column:${cells.length}';
-          if (seenRunSignatures.add(sig)) {
-            entries.add(
-              _ScoredEntry(label: _runSummaryLabel(cells), cells: cells),
-            );
-          }
-        }
-        row = end + 1;
-      }
-    }
+    return bySignature.values.toList();
+  }
 
-    return entries;
+  String _wordSignature(ResolvedWord word) {
+    final IndexedCell start = word.cells.first;
+    return '${word.axis}:${start.row}:${start.column}:${word.cells.length}:${word.word}';
+  }
+
+  void _rebuildMarkedCellCoverage() {
+    final Map<String, int> coverage = <String, int>{};
+    for (final MarkedWord word in _markedWordsBySignature.values) {
+      for (final IndexedCell cell in word.cells) {
+        final String key = '${cell.row}:${cell.column}';
+        coverage[key] = (coverage[key] ?? 0) + 1;
+      }
+    }
+    _markedCellCoverage = coverage;
   }
 
   /// Either drops a batch of junk tiles (if a level boundary was just
@@ -882,10 +1001,30 @@ class GameController extends ChangeNotifier {
     _scheduleTick();
   }
 
-  /// Drops up to [count] random "junk" letters at random columns,
-  /// chosen so they never form a word or matching run on landing.
-  /// Returns true if at least one junk tile was queued for animation.
+  void tapMarkedCell(int row, int column) {
+    if (_isGameOver || _waitingForFlash) {
+      return;
+    }
+    if (isRowLineClear(row)) {
+      _clearLineAt(row);
+    } else {
+      _clearMarkedWordsAt(row: row, column: column);
+    }
+  }
+
+  /// On a level-up (level 2+) tries to place the upcoming tiles as a
+  /// valid 3-letter word. Falls back to random drops at game start
+  /// (level 1) or when no word placement is found.
+  /// Returns true if at least one tile was queued for animation.
   bool _dropJunkTiles(int count) {
+    // Tiles from the level-2+ drops can pop; the initial game-start drop
+    // (level 1) just seeds the board and must always stay.
+    _junkDropCanPop = currentLevel > 1;
+    // At level 2+ attempt a smart word placement first.
+    if (currentLevel > 1 && count >= _junkTilesPerDrop) {
+      if (_trySmartWordDrop()) return true;
+    }
+
     final List<int> available = <int>[];
     for (int c = 0; c < boardColumns; c += 1) {
       if (_board[0][c] == null) {
@@ -912,17 +1051,27 @@ class GameController extends ChangeNotifier {
         continue;
       }
 
-      final String letter = _pickJunkLetter(row, col);
-      final int points = letterPoints[letter] ?? 1;
+      // Take the next letter from the upcoming preview queue and refill.
+      final LetterTile tile = _upcomingTiles.isNotEmpty
+          ? _upcomingTiles.removeAt(0)
+          : _drawLetterTile();
+      _upcomingTiles.add(_drawLetterTile());
 
-      // Provisional placement so subsequent picks see this letter
-      // (avoids two junk tiles together accidentally forming a word).
-      _board[row][col] = LetterTile(letter: letter, points: points);
-      placements.add((row: row, column: col, letter: letter, points: points));
+      // Provisional placement so subsequent picks land in the right rows.
+      _board[row][col] = LetterTile(
+        letter: tile.letter,
+        points: tile.points,
+      );
+      placements.add((
+        row: row,
+        column: col,
+        letter: tile.letter,
+        points: tile.points,
+      ));
       anims.add(
         TileDropAnimation(
-          letter: letter,
-          points: points,
+          letter: tile.letter,
+          points: tile.points,
           column: col,
           fromRow: -1,
           toRow: row,
@@ -930,7 +1079,7 @@ class GameController extends ChangeNotifier {
       );
     }
 
-    // Pull the provisional tiles back off — they'll be re-applied when
+    // Pull the provisional tiles back off — they’ll be re-applied when
     // the animation completes via completePendingLock().
     for (final ({int row, int column, String letter, int points}) p
         in placements) {
@@ -945,47 +1094,111 @@ class GameController extends ChangeNotifier {
     _pendingAnimations = anims;
     _waitingForJunkDrop = true;
     _tickTimer?.cancel();
-    _statusMessage = 'Incoming junk!';
+    _statusMessage = 'Level up! Next letters incoming!';
     notifyListeners();
     return true;
   }
 
-  /// Picks a letter for a junk tile at (row, column) that won't form
-  /// any word or matching run on landing. Falls back to 'Q' if the
-  /// search is exhausted (extremely unlikely on a near-empty board).
-  String _pickJunkLetter(int row, int column) {
-    final List<String> candidates = letterPoints.keys.toList()
-      ..shuffle(_random);
-    for (final String letter in candidates) {
-      _board[row][column] = LetterTile(
-        letter: letter,
-        points: letterPoints[letter] ?? 1,
-      );
-      final List<ResolvedWord> words = _dictionary.findLongestWords(
-        board: _snapshotBoard(),
-        row: row,
-        column: column,
-        minimumLength: minimumWordLength,
-      );
-      final List<List<IndexedCell>> runs = _findMatchingRuns(row, column);
-      _board[row][column] = null;
-      if (words.isEmpty && runs.isEmpty) {
-        return letter;
+  /// The lowest empty row in [col], or -1 if the column is full.
+  int _landingRowForColumn(int col) {
+    int row = boardRows - 1;
+    while (row >= 0 && _board[row][col] != null) {
+      row -= 1;
+    }
+    return row;
+  }
+
+  /// Tries to arrange the first 3 upcoming tiles into a valid 3-letter
+  /// word placed horizontally on the board. All 6 permutations of the
+  /// 3 letters are tested; the first valid word that fits into 3
+  /// consecutive columns sharing the same landing row is placed.
+  /// Returns true if a placement was found and queued.
+  bool _trySmartWordDrop() {
+    if (_upcomingTiles.length < 3) return false;
+
+    final List<LetterTile> peek = _upcomingTiles.take(3).toList();
+    final List<String> letters =
+        peek.map((LetterTile t) => t.letter.toLowerCase()).toList();
+
+    // All 6 permutations of indices [0, 1, 2].
+    const List<List<int>> perms = <List<int>>[
+      <int>[0, 1, 2],
+      <int>[0, 2, 1],
+      <int>[1, 0, 2],
+      <int>[1, 2, 0],
+      <int>[2, 0, 1],
+      <int>[2, 1, 0],
+    ];
+
+    for (final List<int> perm in perms) {
+      final String word =
+          letters[perm[0]] + letters[perm[1]] + letters[perm[2]];
+      if (!_dictionary.contains(word)) continue;
+
+      // Try each run of 3 consecutive columns.
+      for (int startCol = 0; startCol <= boardColumns - 3; startCol += 1) {
+        final int r0 = _landingRowForColumn(startCol);
+        final int r1 = _landingRowForColumn(startCol + 1);
+        final int r2 = _landingRowForColumn(startCol + 2);
+        if (r0 < 0 || r1 < 0 || r2 < 0) continue;
+        if (r0 != r1 || r1 != r2) continue;
+
+        // All three columns share the same landing row — place the word.
+        final List<LetterTile> tiles = _upcomingTiles.take(3).toList();
+        _upcomingTiles.removeRange(0, 3);
+        for (int i = 0; i < 3; i += 1) {
+          _upcomingTiles.add(_drawLetterTile());
+        }
+
+        final int row = r0;
+        final List<({int row, int column, String letter, int points})>
+            placements =
+            <({int row, int column, String letter, int points})>[];
+        final List<TileDropAnimation> anims = <TileDropAnimation>[];
+
+        for (int i = 0; i < 3; i += 1) {
+          final LetterTile tile = tiles[perm[i]];
+          final int col = startCol + i;
+          placements.add((
+            row: row,
+            column: col,
+            letter: tile.letter,
+            points: tile.points,
+          ));
+          anims.add(TileDropAnimation(
+            letter: tile.letter,
+            points: tile.points,
+            column: col,
+            fromRow: -1,
+            toRow: row,
+          ));
+        }
+
+        _pendingJunkPlacements = placements;
+        _pendingAnimations = anims;
+        _waitingForJunkDrop = true;
+        _tickTimer?.cancel();
+        _statusMessage = 'Level up! ${word.toUpperCase()} incoming!';
+        notifyListeners();
+        return true;
       }
     }
-    return 'Q';
+
+    return false;
   }
 
   void _spawnNextTile() {
-    final LetterTile tile = _nextTile ?? _drawLetterTile();
-    _nextTile = _drawLetterTile();
+    final LetterTile tile = _upcomingTiles.isNotEmpty
+        ? _upcomingTiles.removeAt(0)
+        : _drawLetterTile();
+    _upcomingTiles.add(_drawLetterTile());
     const int spawnColumn = boardColumns ~/ 2;
     if (!_canOccupy(0, spawnColumn)) {
       _isGameOver = true;
       _isRunning = false;
       _statusMessage = 'Board full. Tap New Run to go again.';
       _tickTimer?.cancel();
-      _nextTile = null;
+      _upcomingTiles.clear();
       _activeTileHint = null;
       return;
     }
@@ -1048,37 +1261,6 @@ class GameController extends ChangeNotifier {
       maxMultiplier: maxMultiplier,
       badgeText: badgeText,
     );
-  }
-
-  String _runSummaryLabel(List<IndexedCell> run) {
-    final String letter = run.first.letter.toUpperCase();
-    if (run.length == 3) {
-      return 'TRIPLE $letter';
-    }
-    if (run.length == 4) {
-      return 'QUAD $letter';
-    }
-    if (run.length == 5) {
-      return 'PENTA $letter';
-    }
-    return '$letter×${run.length}';
-  }
-
-  String? _badgeForEntry(_ScoredEntry entry, int finalMultiplier) {
-    final String? runBadge = entry.label.startsWith('TRIPLE ')
-        ? 'TRIPLE LETTER'
-        : entry.label.startsWith('QUAD ')
-        ? 'QUAD LETTER'
-        : entry.label.startsWith('PENTA ')
-        ? 'PENTA LETTER'
-        : null;
-    if (runBadge != null) {
-      return finalMultiplier > 1 ? '$runBadge ${finalMultiplier}x' : runBadge;
-    }
-    if (finalMultiplier > 1) {
-      return '${finalMultiplier}x BONUS';
-    }
-    return null;
   }
 
   int _centerRowForCells(List<IndexedCell> cells) {
@@ -1209,62 +1391,6 @@ class GameController extends ChangeNotifier {
     );
   }
 
-  /// Finds runs of 3+ identical letters passing through [row],[column].
-  List<List<IndexedCell>> _findMatchingRuns(int row, int column) {
-    final LetterTile? tile = _board[row][column];
-    if (tile == null) {
-      return const <List<IndexedCell>>[];
-    }
-    final String letter = tile.letter;
-    final List<List<IndexedCell>> runs = <List<IndexedCell>>[];
-
-    // Horizontal scan.
-    int startCol = column;
-    while (startCol > 0 && _board[row][startCol - 1]?.letter == letter) {
-      startCol -= 1;
-    }
-    int endCol = column;
-    while (endCol < boardColumns - 1 &&
-        _board[row][endCol + 1]?.letter == letter) {
-      endCol += 1;
-    }
-    if (endCol - startCol + 1 >= 3) {
-      runs.add(<IndexedCell>[
-        for (int c = startCol; c <= endCol; c += 1)
-          IndexedCell(
-            row: row,
-            column: c,
-            letter: _board[row][c]!.letter,
-            points: _board[row][c]!.effectivePoints,
-          ),
-      ]);
-    }
-
-    // Vertical scan.
-    int startRow = row;
-    while (startRow > 0 && _board[startRow - 1][column]?.letter == letter) {
-      startRow -= 1;
-    }
-    int endRow = row;
-    while (endRow < boardRows - 1 &&
-        _board[endRow + 1][column]?.letter == letter) {
-      endRow += 1;
-    }
-    if (endRow - startRow + 1 >= 3) {
-      runs.add(<IndexedCell>[
-        for (int r = startRow; r <= endRow; r += 1)
-          IndexedCell(
-            row: r,
-            column: column,
-            letter: _board[r][column]!.letter,
-            points: _board[r][column]!.effectivePoints,
-          ),
-      ]);
-    }
-
-    return runs;
-  }
-
   void _applyGravity() {
     final List<TileDropAnimation> gravityAnimations = <TileDropAnimation>[];
 
@@ -1380,7 +1506,7 @@ class GameController extends ChangeNotifier {
         weight = max(1, weight ~/ 3);
       }
       if (!_vowels.contains(entry.key) &&
-          consonantsOnBoard > vowelsOnBoard + 5) {
+          consonantsOnBoard > vowelsOnBoard + 3) {
         weight = max(1, weight ~/ 2);
       }
 
@@ -1655,9 +1781,10 @@ const Map<String, int> _letterFrequencies = <String, int>{
 
 const int _baseBagSize = 98;
 const int _noFourXBottomRows = 4;
-const int _strategicModeMinTiles = 10;
+const int _strategicModeMinTiles = 5;
 const int _maxConsecutiveVowels = 3;
-const int _maxConsecutiveConsonants = 5;
+const int _maxConsecutiveConsonants = 2;
+const int _upcomingQueueSize = 3;
 
 const Set<String> _vowels = <String>{'A', 'E', 'I', 'O', 'U'};
 const List<(int, int)> _orthogonalDirections = <(int, int)>[

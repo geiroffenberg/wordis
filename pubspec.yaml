@@ -37,6 +37,7 @@ dependencies:
   shared_preferences: ^2.5.5
   google_fonts: ^8.0.2
   audioplayers: ^6.6.0
+  google_mobile_ads: ^7.0.0
 
 dev_dependencies:
   flutter_test:
@@ -73,6 +74,9 @@ flutter:
     - assets/tap.wav
     - assets/clear.wav
     - assets/drop.wav
+    - assets/wordfound.wav
+    - assets/lineclear.wav
+    - assets/levelup.wav
 
   # To add assets to your application, add an assets section, like this:
   # assets:

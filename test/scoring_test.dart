@@ -211,111 +211,66 @@ void main() {
       expect(dropAndScore(4, 2, 'T'), 36);
     });
 
-    test('Triple letter run AAA -> sum (3 * 1 = 3)', () {
-      place(6, 0, 'A');
-      place(6, 1, 'A');
-      expect(dropAndScore(6, 2, 'A'), 3);
-    });
-
-    test('Quad letter run AAAA -> sum (4)', () {
-      place(6, 0, 'A');
-      place(6, 1, 'A');
-      place(6, 2, 'A');
-      expect(dropAndScore(6, 3, 'A'), 4);
-    });
-
-    test('Triple letter run with 2x -> sum * 2', () {
-      place(6, 0, 'P'); // P=3
-      place(6, 1, 'P');
-      controller.setMultiplierForTesting(6, 1, 2);
-      // 3+3+3 = 9, * 2 = 18
-      expect(dropAndScore(6, 2, 'P'), 18);
-    });
-
-    test('Triple letter run with 4x -> sum * 4', () {
+    test('Matching-letter runs no longer score by themselves', () {
       place(6, 0, 'P');
       place(6, 1, 'P');
-      controller.setMultiplierForTesting(6, 0, 4);
-      expect(dropAndScore(6, 2, 'P'), 36);
+      controller.setMultiplierForTesting(6, 1, 4);
+      expect(dropAndScore(6, 2, 'P'), 0);
     });
 
-    test('Quad letter run with 2x -> sum * 2', () {
-      place(6, 0, 'P');
-      place(6, 1, 'P');
-      place(6, 2, 'P');
-      controller.setMultiplierForTesting(6, 1, 2);
-      // 4 * 3 = 12, * 2 = 24
-      expect(dropAndScore(6, 3, 'P'), 24);
-    });
-
-    test('Quad letter run with 3x -> sum * 3', () {
-      place(6, 0, 'P');
-      place(6, 1, 'P');
-      place(6, 2, 'P');
-      controller.setMultiplierForTesting(6, 2, 3);
-      // 4 * 3 = 12, * 3 = 36
-      expect(dropAndScore(6, 3, 'P'), 36);
-    });
-
-    test('Quintuple letter run with 4x -> sum * 4', () {
-      place(6, 0, 'P');
-      place(6, 1, 'P');
-      place(6, 2, 'P');
-      place(6, 3, 'P');
-      controller.setMultiplierForTesting(6, 2, 4);
-      // 5 * 3 = 15, * 4 = 60
-      expect(dropAndScore(6, 4, 'P'), 60);
-    });
-
-    test('Quintuple letter run with no bonus -> sum', () {
-      place(6, 0, 'P');
-      place(6, 1, 'P');
-      place(6, 2, 'P');
-      place(6, 3, 'P');
-      // 5 * 3 = 15
-      expect(dropAndScore(6, 4, 'P'), 15);
-    });
-
-    test('Word + run on opposite axis acts as double-word', () {
-      // Horizontal word "TOP" (T,O,P) and vertical run "T,T,T" through
-      // the placed T at (6,0).
+    test('Word + non-word cross only scores the word', () {
       place(4, 0, 'T');
       place(5, 0, 'T');
       place(6, 1, 'O');
       place(6, 2, 'P');
 
-      // Drop T at (6,0):
-      // Horizontal word TOP cells: (6,0)T, (6,1)O, (6,2)P -> 1+1+3 = 5
-      // Vertical run TTT cells: (4,0),(5,0),(6,0) -> 1+1+1 = 3
-      // Unique cells: T(4,0)+T(5,0)+T(6,0)+O(6,1)+P(6,2) = 1+1+1+1+3 = 7
-      // Double word x2 = 14
-      expect(dropAndScore(6, 0, 'T'), 14);
+      expect(dropAndScore(6, 0, 'T'), 5);
     });
 
-    test('Chain reaction: clearing a row drops a tile that forms another word',
-        () {
-      // Setup at row 8 (second from bottom): A,A,A across cols 0..2.
-      // Row 9 (bottom): T at col 0, P at col 2 (the col 1 below A is empty).
-      // Above row 8 col 1 we stack an O at row 7.
-      // Drop A at (8,1) -> AAA run clears row 8.
-      // Gravity then drops O at (7,1) down to (9,1) -> TOP forms at row 9.
-      place(9, 0, 'T');
-      place(9, 2, 'P');
-      place(8, 0, 'A');
-      place(8, 2, 'A');
-      place(7, 1, 'O');
+    test('Tapping a marked word clears it and scores again', () {
+      place(6, 0, 'T');
+      place(6, 1, 'O');
 
-      final int before = controller.score;
+      final int beforeDrop = controller.score;
       controller.setActiveTileForTesting(
-        const FallingTile(letter: 'A', points: 1, row: 8, column: 1),
+        const FallingTile(letter: 'P', points: 3, row: 6, column: 2),
       );
       controller.lockActiveTileForTesting();
-      // First scoring: AAA run = 3.
-      expect(controller.score - before, 3);
-      // Simulate the UI completing the flash so gravity + chain pass run.
+      expect(controller.score - beforeDrop, 5);
+
+      final int beforeTap = controller.score;
+      controller.tapMarkedCell(6, 1);
+      expect(controller.score - beforeTap, 5);
+
       controller.completeFlashPhase();
-      // After gravity, O lands at (9,1) forming "TOP" -> +5.
-      expect(controller.score - before, 8);
+      expect(controller.board[6][0], isNull);
+      expect(controller.board[6][1], isNull);
+      expect(controller.board[6][2], isNull);
+    });
+
+    test('Tap-clear can trigger gravity-formed words that auto-mark and score', () {
+      // Stack CAT above TOP so clearing TOP drops CAT into place.
+      place(8, 0, 'C');
+      place(8, 1, 'A');
+      place(7, 2, 'T');
+      place(9, 0, 'T');
+      place(9, 1, 'O');
+
+      controller.setActiveTileForTesting(
+        const FallingTile(letter: 'P', points: 3, row: 9, column: 2),
+      );
+      controller.lockActiveTileForTesting();
+      expect(controller.score, 5);
+
+      final int beforeTap = controller.score;
+      controller.tapMarkedCell(9, 1);
+      // Clear score for 3-letter TOP at level 1 is the same base value.
+      expect(controller.score - beforeTap, 5);
+
+      final int beforeResolve = controller.score;
+      controller.completeFlashPhase();
+      // CAT forms after gravity and is scored as a newly marked word.
+      expect(controller.score - beforeResolve, 5);
     });
   });
 
